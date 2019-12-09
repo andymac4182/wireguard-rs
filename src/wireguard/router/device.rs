@@ -8,6 +8,7 @@ use std::time::Instant;
 use log::debug;
 use spin::{Mutex, RwLock};
 use zerocopy::LayoutVerified;
+use crossbeam_channel::{bounded, Sender};
 
 use super::anti_replay::AntiReplay;
 use super::pool::Job;
@@ -24,7 +25,6 @@ use super::route::RoutingTable;
 use super::runq::RunQueue;
 
 use super::super::{tun, udp, Endpoint, KeyPair};
-use super::queue::ParallelQueue;
 
 pub struct DeviceInner<E: Endpoint, C: Callbacks, T: tun::Writer, B: udp::Writer<E>> {
     // inbound writer (TUN)
@@ -38,8 +38,9 @@ pub struct DeviceInner<E: Endpoint, C: Callbacks, T: tun::Writer, B: udp::Writer
     pub table: RoutingTable<Peer<E, C, T, B>>,
 
     // work queues
-    pub queue_outbound: ParallelQueue<Job<Peer<E, C, T, B>, outbound::Outbound>>,
-    pub queue_inbound: ParallelQueue<Job<Peer<E, C, T, B>, inbound::Inbound<E, C, T, B>>>,
+    // TODO: avoid locks on sender (muti-queue interface)
+    pub queue_outbound: Mutex<Sender<Job<Peer<E, C, T, B>, outbound::Outbound>>>,
+    pub queue_inbound: Mutex<Sender<Job<Peer<E, C, T, B>, inbound::Inbound<E, C, T, B>>>>,
 
     // run queues
     pub run_inbound: RunQueue<Peer<E, C, T, B>>,
@@ -101,8 +102,8 @@ impl<E: Endpoint, C: Callbacks, T: tun::Writer, B: udp::Writer<E>> Drop
         debug!("router: dropping device");
 
         // close worker queues
-        self.state.queue_outbound.close();
-        self.state.queue_inbound.close();
+        *self.state.queue_outbound.lock() = bounded(0).0;
+        *self.state.queue_inbound.lock() = bounded(0).0;
 
         // close run queues
         self.state.run_outbound.close();
@@ -111,7 +112,6 @@ impl<E: Endpoint, C: Callbacks, T: tun::Writer, B: udp::Writer<E>> Drop
         // join all worker threads
         while match self.handles.pop() {
             Some(handle) => {
-                handle.thread().unpark();
                 handle.join().unwrap();
                 true
             }
@@ -125,14 +125,14 @@ impl<E: Endpoint, C: Callbacks, T: tun::Writer, B: udp::Writer<E>> Drop
 impl<E: Endpoint, C: Callbacks, T: tun::Writer, B: udp::Writer<E>> DeviceHandle<E, C, T, B> {
     pub fn new(num_workers: usize, tun: T) -> DeviceHandle<E, C, T, B> {
         // allocate shared device state
-        let (mut outrx, queue_outbound) = ParallelQueue::new(num_workers);
-        let (mut inrx, queue_inbound) = ParallelQueue::new(num_workers);
+        let (oub_tx, oub_rx) = bounded(256);
+        let (inb_tx, inb_rx) = bounded(256);
         let device = Device {
             inner: Arc::new(DeviceInner {
                 inbound: tun,
-                queue_inbound,
                 outbound: RwLock::new((true, None)),
-                queue_outbound,
+                queue_inbound: Mutex::new(inb_tx),
+                queue_outbound: Mutex::new(oub_tx),
                 run_inbound: RunQueue::new(),
                 run_outbound: RunQueue::new(),
                 recv: RwLock::new(HashMap::new()),
@@ -147,8 +147,8 @@ impl<E: Endpoint, C: Callbacks, T: tun::Writer, B: udp::Writer<E>> DeviceHandle<
         for _ in 0..num_workers {
             // parallel workers (parallel processing)
             {
+                let rx = inb_rx.clone();
                 let device = device.clone();
-                let rx = inrx.pop().unwrap();
                 threads.push(thread::spawn(move || {
                     log::debug!("inbound parallel router worker started");
                     inbound::parallel(device, rx)
@@ -169,8 +169,8 @@ impl<E: Endpoint, C: Callbacks, T: tun::Writer, B: udp::Writer<E>> DeviceHandle<
         for _ in 0..num_workers {
             // parallel workers (parallel processing)
             {
+                let rx = oub_rx.clone();
                 let device = device.clone();
-                let rx = outrx.pop().unwrap();
                 threads.push(thread::spawn(move || {
                     log::debug!("outbound parallel router worker started");
                     outbound::parallel(device, rx)
@@ -247,7 +247,7 @@ impl<E: Endpoint, C: Callbacks, T: tun::Writer, B: udp::Writer<E>> DeviceHandle<
 
         // schedule for encryption and transmission to peer
         if let Some(job) = peer.send_job(msg, true) {
-            self.state.queue_outbound.send(job);
+            self.state.queue_outbound.lock().send(job);
         }
 
         Ok(())
@@ -296,7 +296,7 @@ impl<E: Endpoint, C: Callbacks, T: tun::Writer, B: udp::Writer<E>> DeviceHandle<
         // schedule for decryption and TUN write
         if let Some(job) = dec.peer.recv_job(src, dec.clone(), msg) {
             log::trace!("schedule decryption of transport message");
-            self.state.queue_inbound.send(job);
+            self.state.queue_inbound.lock().send(job);
         }
         Ok(())
     }

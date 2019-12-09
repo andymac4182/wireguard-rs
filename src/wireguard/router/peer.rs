@@ -245,7 +245,7 @@ impl<E: Endpoint, C: Callbacks, T: tun::Writer, B: udp::Writer<E>> Peer<E, C, T,
         log::debug!("peer.send_raw");
         match self.send_job(msg, false) {
             Some(job) => {
-                self.device.queue_outbound.send(job);
+                self.device.queue_outbound.lock().send(job);
                 debug!("send_raw: got obtained send_job");
                 true
             }

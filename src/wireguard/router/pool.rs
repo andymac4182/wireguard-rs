@@ -1,8 +1,9 @@
+use std::mem;
+use std::sync::Arc;
+
 use arraydeque::ArrayDeque;
 use spin::{Mutex, MutexGuard};
-use std::mem;
-use std::sync::mpsc::Receiver;
-use std::sync::Arc;
+use crossbeam_channel::Receiver;
 
 use super::runq::{RunQueue, ToKey};
 
